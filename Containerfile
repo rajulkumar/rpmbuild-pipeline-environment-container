@@ -1,4 +1,4 @@
-FROM fedora:41
+FROM registry.fedoraproject.org/fedora:41
 
 # https://github.com/containers/buildah/issues/3666#issuecomment-1351992335
 VOLUME /var/lib/containers
