@@ -7,17 +7,20 @@ RPM repositories, file repositories, and content uploads with OAuth2 authenticat
 """
 
 import argparse
-import concurrent.futures
 import glob
+import hashlib
 import json
 import logging
 import os
 import sys
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+
+
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Generator
 from urllib.parse import urlencode
 
 import requests
@@ -29,7 +32,7 @@ from urllib3.util import Retry
 DEFAULT_TIMEOUT = 60
 DEFAULT_CONFIG_PATH = "~/.config/pulp/cli.toml"
 DEFAULT_OUTPUT_JSON = "pulp_results.json"
-DEFAULT_MAX_WORKERS = 3
+DEFAULT_MAX_WORKERS = 4
 DEFAULT_TASK_TIMEOUT = 86400
 TASK_SLEEP_INTERVAL = 5
 SUPPORTED_ARCHITECTURES = ["x86_64", "aarch64", "s390x", "ppc64le"]
@@ -37,6 +40,11 @@ SUPPORTED_ARCHITECTURES = ["x86_64", "aarch64", "s390x", "ppc64le"]
 # HTTP status codes to retry on
 RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
+# Batch size for checking RPMs on Pulp
+BATCH_SIZE = 50
+
+# Chunk size for get_file_locations() GET requests
+GET_FILE_LOC_CHUNK_SIZE = 20
 
 class OAuth2ClientCredentialsAuth(requests.auth.AuthBase):
     """
@@ -149,6 +157,7 @@ class OAuth2ClientCredentialsAuth(requests.auth.AuthBase):
         return self._expire_at
 
 
+# pylint: disable=too-many-public-methods
 class PulpClient:
     """
     A client for interacting with Pulp API.
@@ -191,6 +200,79 @@ class PulpClient:
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
+
+    def _chunked_get(self, url: str, params: Optional[Dict[str, Any]] = None,
+                     chunk_param: Optional[str] = None, chunk_size: int = 50, **kwargs) -> Response:
+        # Perform a GET request with chunking for large parameter lists.
+        #
+        # This is a workaround for the fact that requests with large parameter
+        # values using "GET" method fails with "Request Line is too large".
+        # Hence, this splits the parameter value into chunks of the given size,
+        # and makes a separate request for each chunk. The results are aggregated
+        # into a single response.
+        #
+        # Note: - chunks are created on only one parameter at a time.
+        #       - response object of the last chunk is returned with the aggregated results.
+
+        if not params or not chunk_param or chunk_param not in params:
+            # No chunking needed, make regular request
+            return self.session.get(url, params=params, **kwargs)
+
+        # Extract the parameter value and check if it needs chunking
+        param_value = params[chunk_param]
+        if not isinstance(param_value, str) or ',' not in param_value:
+            # Not a comma-separated list, make regular request
+            return self.session.get(url, params=params, **kwargs)
+
+        values = [v.strip() for v in param_value.split(',')]
+
+        if len(values) <= chunk_size:
+            # Small list, make regular request
+            return self.session.get(url, params=params, **kwargs)
+
+        # Need to chunk the request
+        logging.debug("Chunking parameter '%s' with %d values for request %s", chunk_param, len(values), url)
+
+        all_results = []
+        chunks = [values[i:i + chunk_size] for i in range(0, len(values), chunk_size)]
+        last_response = None
+
+        for i, chunk in enumerate(chunks, 1):
+            logging.debug("Processing chunk %d/%d with %d values", i, len(chunks), len(chunk))
+
+            # Create params for this chunk
+            chunk_params = params.copy()
+            chunk_params[chunk_param] = ','.join(chunk)
+
+            try:
+                response = self.session.get(url, params=chunk_params, **kwargs)
+                check_response(response, f"chunked request {i}")
+                last_response = response
+
+                # Parse and aggregate results
+                chunk_data = response.json()
+                if chunk_data.get('results'):
+                    all_results.extend(chunk_data['results'])
+
+            except Exception as e:
+                logging.error("Failed to process chunk %d: %s", i, e)
+                raise
+
+        # Create aggregated response
+        if last_response:
+            aggregated_data = {
+                "count": len(all_results),
+                "results": all_results
+            }
+
+            # Modify response content to return aggregated results from all chunks
+            # intentionally modifying _content
+            # pylint: disable=W0212 (protected-access)
+            last_response._content = json.dumps(aggregated_data).encode('utf-8')
+            return last_response
+
+        # Fallback: return empty response
+        return self.session.get(url, params={chunk_param: ""}, **kwargs)
 
     @classmethod
     def create_from_config_file(cls, path: Optional[str] = None, domain: Optional[str] = None,
@@ -398,9 +480,22 @@ class PulpClient:
     def get_file_locations(self, artifacts: List[Dict[str, str]]) -> Response:
         """Get file locations for artifacts."""
         hrefs = [list(artifact.values())[0] for artifact in artifacts]
-        hrefs_string = ','.join(hrefs)
-        url = self._url(f"api/v3/artifacts/?pulp_href__in={hrefs_string}")
-        return self.session.get(url, timeout=self.timeout, **self.request_params)
+        url = self._url("api/v3/artifacts/")
+        params = {
+            "pulp_href__in": ','.join(hrefs)
+        }
+        return self._chunked_get(url, params=params, chunk_param="pulp_href__in",
+                                timeout=self.timeout, chunk_size=GET_FILE_LOC_CHUNK_SIZE,
+                                **self.request_params)
+
+    def get_rpm_by_pkgIDs(self, pkg_ids: List[str]) -> Response:
+        """Get RPMs by package IDs."""
+        url = self._url("api/v3/content/rpm/packages/")
+        params = {
+            "pkgId__in": ",".join(pkg_ids)
+        }
+        return self._chunked_get(url, params=params, chunk_param="pkgId__in",
+                                timeout=self.timeout, **self.request_params)
 
 
 def check_response(response: Response, operation: str = "request") -> None:
@@ -438,37 +533,192 @@ def upload_log(client: PulpClient, file_repository_prn: str, log_path: str,
     client.wait_for_finished_task(content_upload_response.json()['task'])
 
 
+def _create_batches(items: List[str], batch_size: int = 100) -> Generator[List[str], None, None]:
+    """
+    Split a list into batches of specified size using a generator.
+    """
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
+
+
+def _calculate_sha256_checksum(file_path: str) -> str:
+    """
+    Calculate SHA256 checksum of a file.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    sha256_hash = hashlib.sha256()
+
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(chunk)
+    except IOError as e:
+        raise IOError(f"Error reading file {file_path}: {e}") from e
+
+    return sha256_hash.hexdigest()
+
+
+def _get_nvra(result: Dict[str, Any]) -> str:
+    """Get NVRA from Pulp response."""
+    return f"{result.get('name')}-{result.get('version')}-{result.get('release')}.{result.get('arch')}"
+
+
+def _process_single_batch(
+    client: PulpClient,
+    batch: List[str],
+    batch_num: int,
+    total_batches: int,
+) -> Dict[str, Any]:
+    """
+    Process a single batch to find RPM files on Pulp.
+    """
+    logging.info("Processing batch %d/%d with %d files", batch_num, total_batches, len(batch))
+
+    # Calculate checksums for the current batch
+    checksums = []
+    for rpm_file in batch:
+        try:
+            checksum = _calculate_sha256_checksum(rpm_file)
+            checksums.append(checksum)
+            logging.debug("Calculated checksum for %s: %s", os.path.basename(rpm_file), checksum)
+        except Exception as e: # pylint: disable=W0718 broad-exception-caught
+            logging.error("Failed to calculate checksum for %s: %s", rpm_file, e)
+            continue
+
+    # Lookup RPMs on Pulp
+    try:
+        response = client.get_rpm_by_pkgIDs(checksums)
+        check_response(response)
+        response_data = response.json()
+
+        # Extract found checksums from the API response
+        found_checksums = set()
+        found_on_pulp = {}
+        if response_data.get('results'):
+            # Create a dictionary of checksums and their corresponding artifacts for the existing RPMs on Pulp
+            found_on_pulp = {result.get('pkgId'):{f"{_get_nvra(result)}.rpm":result.get('pulp_href')}
+                             for result in response_data['results'] if result.get('pkgId')}
+
+        # Find checksums that were NOT found in the response
+        found_checksums = set(found_on_pulp.keys())
+        missing_checksums = set(checksums) - found_checksums
+
+        # Find rpms corresponding to missing checksums
+        missing_rpms = []
+        found_rpms = []
+        for i, checksum in enumerate(checksums):
+            if checksum in missing_checksums:
+                logging.debug("Missing rpm: %s", batch[i])
+                missing_rpms.append(batch[i])
+            elif checksum in found_checksums:
+                logging.debug("Found rpm: %s", batch[i])
+                logging.debug("Found artifact: %s", found_on_pulp[checksum])
+                found_rpms.append(batch[i])
+
+        # Return found and missing rpms
+        logging.info("Batch %d: %d rpms completed. Found %d rpms, %d missing",
+                     batch_num, len(batch), len(found_checksums), len(missing_checksums))
+        return {
+            "batch_number": batch_num,
+            "missing_rpms": missing_rpms,
+            "missing_checksums": missing_checksums,
+            "found_rpms": found_rpms,
+            "found_checksums": list(found_on_pulp.keys()),
+            "found_artifacts": list(found_on_pulp.values()),
+        }
+
+    except Exception as e: # pylint: disable=W0718 broad-exception-caught
+        logging.error("Request failed for batch %d: %s", batch_num, e)
+        # Add all files to the list of missing rpms
+        return {
+            "batch_number": batch_num,
+            "missing_rpms": batch,
+            "missing_checksums": checksums,
+            "found_rpms": [],
+            "found_checksums": [],
+            "found_artifacts": [],
+            "error": str(e)
+        }
+
+
+def check_rpms_on_pulp(client: PulpClient, rpms: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Check if RPMs are already on Pulp."""
+    # Create batches and convert generator to list to get total count
+    batches = list(_create_batches(rpms, BATCH_SIZE))
+    logging.info("Created %d batches with %d rpms for lookup in Pulp", len(batches), len(rpms))
+
+    missing_rpms = []
+    found_artifacts = []
+
+    # Use ThreadPoolExecutor for parallel batch processing
+    with ThreadPoolExecutor(thread_name_prefix="check_rpms_on_pulp", max_workers=DEFAULT_MAX_WORKERS) as executor:
+        # Submit all batches for processing
+        future_to_batch = {
+            executor.submit(
+                _process_single_batch,
+                client,
+                batch,
+                batch_num,
+                len(batches),
+            ): batch_num
+            for batch_num, batch in enumerate(batches, 1)
+        }
+
+        logging.info("Submitted %d batches with %d workers", len(future_to_batch), DEFAULT_MAX_WORKERS)
+
+        # Collect results as they complete
+        for future in as_completed(future_to_batch):
+            batch_num = future_to_batch[future]
+            try:
+                result = future.result()
+                # Only add batches with missing rpms
+                if result is not None:
+                    missing_rpms.extend(result["missing_rpms"])
+                    found_artifacts.extend(result["found_artifacts"])
+            except Exception as e: # pylint: disable=W0718 broad-exception-caught
+                logging.error("Batch %d processing failed with exception: %s", batch_num, e)
+                # Add all files to the list of missing rpms
+                missing_rpms.extend(batches[batch_num - 1])
+                found_artifacts.extend([])
+
+    logging.info("Lookup completed. %d missing rpms, %d found rpms", len(missing_rpms), len(found_artifacts))
+    return missing_rpms, found_artifacts
+
+
 def upload_rpms_logs(rpm_path: str, args: argparse.Namespace, client: PulpClient, arch: str,
-                     rpm_repository_href: str, file_repository_prn: str, date: str) -> None:
+                     rpm_repository_href: str, file_repository_prn: str, date: str) -> \
+                     Tuple[List[str], List[Dict[str, str]]]:
     """Upload RPMs and logs for a specific architecture."""
     rpms = glob.glob(os.path.join(rpm_path, "*.rpm"))
     logs = glob.glob(os.path.join(rpm_path, "*.log"))
 
     if not rpms and not logs:
         logging.info("No RPMs or logs found in %s", rpm_path)
-        return
+        return [], []
 
     labels = create_labels(args.build_id, arch, args.namespace, args.parent_package, date)
 
-    # Upload RPMs in parallel
-    rpm_results_artifacts = []
-    if rpms:
-        logging.info("Uploading %s RPM files for %s", len(rpms), arch)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
-            futures = [executor.submit(create_rpm_content, client, rpm, labels) for rpm in rpms]
-            rpm_results_artifacts = [future.result() for future in concurrent.futures.as_completed(futures)]
+    # Check if RPMs are already on Pulp
+    rpms_to_upload, existing_artifacts = check_rpms_on_pulp(client, rpms)
 
-    # Upload logs sequentially
-    if logs:
-        logging.info("Uploading %s log files for %s", len(logs), arch)
-        for log in logs:
-            upload_log(client, file_repository_prn, log, args.build_id, labels)
+    # Upload RPMs in parallel that were not found on Pulp
+    with ThreadPoolExecutor(thread_name_prefix="upload_rpms", max_workers=DEFAULT_MAX_WORKERS) as executor:
+        futures = [executor.submit(create_rpm_content, client, rpm, labels) for rpm in rpms_to_upload]
+        rpm_results_artifacts = [future.result() for future in as_completed(futures)]
 
-    # Add RPM content to repository
+    # Add uploaded RPMs to the repository
     if rpm_results_artifacts:
         logging.info("Adding %s RPM artifacts to repository", len(rpm_results_artifacts))
         rpm_repo_results = client.add_content(rpm_repository_href, rpm_results_artifacts)
         client.wait_for_finished_task(rpm_repo_results.json()['task'])
+
+    # Upload logs sequentially
+    for log in logs:
+        upload_log(client, file_repository_prn, log, args.build_id, labels)
+
+    return rpms_to_upload, existing_artifacts
 
 
 def create_or_get_repository(client: PulpClient, repository_name: str, repo_type: str) -> Tuple[str, Optional[str]]:
@@ -554,7 +804,8 @@ def upload_sbom(client: PulpClient, args: argparse.Namespace, sbom_repository_pr
     client.wait_for_finished_task(content_upload_response.json()['task'])
 
 
-def collect_results(client: PulpClient, args: argparse.Namespace, date: str, artifact_repository_prn: str) -> None:
+def collect_results(client: PulpClient, args: argparse.Namespace, date: str, artifact_repository_prn: str,
+                    extra_artifacts: List[Dict[str, str]] = None) -> None:
     """Collect results and write to JSON file."""
     logging.info("Collecting results for build ID: %s", args.build_id)
 
@@ -565,6 +816,11 @@ def collect_results(client: PulpClient, args: argparse.Namespace, date: str, art
     if not artifacts:
         logging.warning("No artifacts found for build ID: %s", args.build_id)
         return
+
+    # Add extra artifacts if provided
+    if extra_artifacts:
+        logging.info("Adding %d extra artifacts", len(extra_artifacts))
+        artifacts.extend(extra_artifacts)
 
     # Get file locations for all artifacts
     file_locations_json = client.get_file_locations(artifacts).json()["results"]
@@ -736,33 +992,42 @@ def _process_uploads(client: PulpClient, args: argparse.Namespace,
         raise ValueError("RPM repository href is required but not found")
 
     # Process each architecture
-    _process_architecture_uploads(client, args, repositories, date_str, rpm_href)
+    processed_uploads = _process_architecture_uploads(client, args, repositories, date_str, rpm_href)
+    existing_rpm_artifacts = [artifact for upload in processed_uploads.values()
+                             for artifact in upload["existing_rpm_artifacts"]]
 
     # Upload SBOM
     upload_sbom(client, args, repositories["sbom_prn"], date_str)
 
     # Collect and save results
-    collect_results(client, args, date_str, repositories["artifacts_prn"])
+    collect_results(client, args, date_str, repositories["artifacts_prn"], existing_rpm_artifacts)
 
 
 def _process_architecture_uploads(client: PulpClient, args: argparse.Namespace,
-                                repositories: Dict[str, str], date_str: str, rpm_href: str) -> None:
+                                repositories: Dict[str, str], date_str: str, rpm_href: str) -> Dict[str, Any]:
     """Process uploads for all supported architectures."""
-    processed_archs = []
+    processed_archs = {}
 
     for arch in SUPPORTED_ARCHITECTURES:
         arch_path = os.path.join(args.rpm_path, arch)
         if os.path.exists(arch_path):
             logging.info("Processing architecture: %s", arch)
-            upload_rpms_logs(arch_path, args, client, arch, rpm_href, repositories["logs_prn"], date_str)
-            processed_archs.append(arch)
+            uploaded_rpms, existing_rpm_artifacts = upload_rpms_logs(arch_path, args, client, arch,
+                                                             rpm_href, repositories["logs_prn"],
+                                                             date_str)
+            processed_archs[arch] = {
+                "uploaded_rpms": uploaded_rpms,
+                "existing_rpm_artifacts": existing_rpm_artifacts,
+            }
         else:
             logging.debug("Skipping %s - path does not exist: %s", arch, arch_path)
 
     if not processed_archs:
         logging.warning("No architecture directories found in %s", args.rpm_path)
     else:
-        logging.info("Processed architectures: %s", ", ".join(processed_archs))
+        logging.info("Processed architectures: %s", ", ".join(processed_archs.keys()))
+
+    return processed_archs
 
 
 if __name__ == "__main__":
